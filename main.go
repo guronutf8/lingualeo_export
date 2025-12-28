@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,15 +13,19 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
 	authURL     = "https://lingualeo.com/api/auth"
 	getWordsURL = "https://api.lingualeo.com/GetWords"
-
-	email    = ""
-	password = ""
 )
+
+type Config struct {
+	Email    string `yaml:"email"`
+	Password string `yaml:"password"`
+}
 
 type BodyAuth struct {
 	Type        string              `json:"type"`
@@ -118,16 +123,33 @@ type GetWordRequest struct {
 }
 
 func main() {
+	// Flags: allow overriding credentials or config path
+	var (
+		emailFlag    string
+		passwordFlag string
+		configPath   string
+	)
+	flag.StringVar(&emailFlag, "email", "", "Account email (overrides config file if set)")
+	flag.StringVar(&passwordFlag, "password", "", "Account password (overrides config file if set)")
+	flag.StringVar(&configPath, "config", "config.yaml", "Path to YAML config file with 'email' and 'password'")
+	flag.Parse()
+
+	// Resolve credentials: flags first, then YAML config
+	email, password, err := resolveCredentials(emailFlag, passwordFlag, configPath)
+	if err != nil {
+		fmt.Println("credentials error:", err)
+		os.Exit(1)
+	}
 	// HTTP client with timeout
 	client := &http.Client{Timeout: 20 * time.Second}
 
-	rememberCookie, err := authenticate(context.Background(), client)
+	rememberCookie, err := authenticate(context.Background(), client, email, password)
 	if err != nil {
 		fmt.Println("auth error:", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("remember cookie: %s\n", rememberCookie)
+	//fmt.Printf("remember cookie: %s\n", rememberCookie)
 	fmt.Println("Authorization successfully completed")
 
 	// Prepare TSV output file
@@ -272,7 +294,7 @@ func main() {
 	fmt.Printf("unique words: %d\n", len(seen))
 }
 
-func authenticate(ctx context.Context, client *http.Client) (string, error) {
+func authenticate(ctx context.Context, client *http.Client, email, password string) (string, error) {
 	// Prepare body according to BodyAuth structure
 	body := BodyAuth{
 		Type: "email",
@@ -308,73 +330,28 @@ func authenticate(ctx context.Context, client *http.Client) (string, error) {
 	return "", errors.New("remember cookie not found in auth response")
 }
 
-func getWords(ctx context.Context, client *http.Client, remember string) (*GetWordResponse, error) {
-	// Build request payload
-	var reqBody GetWordRequest
-	reqBody.APIVersion = "1.0.1"
-	reqBody.AttrList.Association = "as"
-	reqBody.AttrList.CombinedTranslation = "trc"
-	reqBody.AttrList.Created = "cd"
-	reqBody.AttrList.ID = "id"
-	reqBody.AttrList.LearningStatus = "ls"
-	reqBody.AttrList.ListWordSets = "listWordSets"
-	reqBody.AttrList.Origin = "wo"
-	reqBody.AttrList.Picture = "pic"
-	reqBody.AttrList.Progress = "pi"
-	reqBody.AttrList.Pronunciation = "pron"
-	reqBody.AttrList.RelatedWords = "rw"
-	reqBody.AttrList.SpeechPartID = "pid"
-	reqBody.AttrList.Trainings = "trainings"
-	reqBody.AttrList.Transcription = "scr"
-	reqBody.AttrList.Translations = "trs"
-	reqBody.AttrList.WordLemmaID = "lid"
-	reqBody.AttrList.WordLemmaValue = "lwd"
-	reqBody.AttrList.WordSets = "ws"
-	reqBody.AttrList.WordType = "wt"
-	reqBody.AttrList.WordValue = "wd"
-	reqBody.Category = ""
-	reqBody.DateGroup = "start"
-	reqBody.Mode = "basic"
-	reqBody.Offset = nil
-	reqBody.PerPage = 30
-	reqBody.Search = ""
-	reqBody.Status = ""
-	reqBody.Training = nil
-	reqBody.WordSetID = 1
-
-	b, err := json.Marshal(reqBody)
+// resolveCredentials returns email/password using the following precedence:
+// 1) Non-empty flag values
+// 2) YAML file at configPath with keys 'email' and 'password'
+func resolveCredentials(emailFlag, passwordFlag, configPath string) (string, string, error) {
+	if strings.TrimSpace(emailFlag) != "" && strings.TrimSpace(passwordFlag) != "" {
+		return emailFlag, passwordFlag, nil
+	}
+	// Try YAML file
+	f, err := os.Open(configPath)
 	if err != nil {
-		return nil, err
+		return "", "", fmt.Errorf("open config file: %w", err)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, getWordsURL, bytes.NewReader(b))
-	if err != nil {
-		return nil, err
+	defer f.Close()
+	var cfg Config
+	dec := yaml.NewDecoder(f)
+	if err := dec.Decode(&cfg); err != nil {
+		return "", "", fmt.Errorf("parse YAML: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if remember != "" {
-		req.Header.Add("Cookie", fmt.Sprintf("remember=%s", remember))
+	if strings.TrimSpace(cfg.Email) == "" || strings.TrimSpace(cfg.Password) == "" {
+		return "", "", errors.New("email/password are empty in config or flags")
 	}
-
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	bodyBytes, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if res.StatusCode < 200 || res.StatusCode > 299 {
-		return nil, fmt.Errorf("GetWords HTTP %d: %s", res.StatusCode, string(bodyBytes))
-	}
-
-	var parsed GetWordResponse
-	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
-		return nil, err
-	}
-	return &parsed, nil
+	return cfg.Email, cfg.Password, nil
 }
 
 // getWordsPage sends a GetWords request for a specific word set, date group and offset
